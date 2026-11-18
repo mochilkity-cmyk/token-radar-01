@@ -1,4 +1,4 @@
-// Token Radar, model "radar-2": one frozen snapshot in, one ranked board out.
+// Token Radar, model "radar-3": one frozen snapshot in, one ranked board out.
 //
 // What the board ranks: every pre-token protocol in the snapshot that can be
 // ranked — the whole watchlist (the floor) plus every other pre-token protocol
@@ -24,19 +24,34 @@
 //     in the protocol, so implied value starts at a quarter of TVL.
 //   - growth: a protocol whose TVL grew 7 days in a row is finding users
 //     now; one that is shrinking is losing them. Clamped so one wild week
-//     cannot carry a row.
+//     cannot carry a row. The weight is 0.8, so a protocol that doubled its
+//     TVL in a week earns a 96% premium and one that halved it loses 40% —
+//     growth reorders the board where TVLs are close, but it never lets a
+//     small protocol outrank a giant on momentum alone: implied value is a
+//     value, not a ranking score.
 //   - maturity: age with no token is the launch signal itself. A protocol
-//     listed days ago has barely proven it can run; one listed a year ago
-//     with a large TVL and still no token is the classic airdrop candidate;
-//     one that has run three years with no token is less likely to launch
-//     one at all. The curve rises from 0.55 to 1.00 over the first year,
-//     holds a year, then falls back toward 0.70.
+//     listed days ago has barely proven it can run, so it scores 0.45; one
+//     listed a year ago with a large TVL and still no token is the classic
+//     airdrop candidate and scores 1.00; one that has run three years with
+//     no token is less likely to launch one at all, so it falls back toward
+//     0.55. The curve is steep on purpose: age is the one figure that
+//     separates a launch that may come from a protocol that has decided
+//     not to launch, and the board should show it.
 //   - chain: a protocol live on several chains has more users to farm and
 //     more places a token can land; each extra chain adds 2%, capped at 10%.
 //
+// The Momentum screen is a second, separate view, not a second ranking: the
+// twelve fastest-growing rankable protocols by seven-day growth (growth
+// capped at +150% for ranking, so one wild week — usually a re-listing, not
+// a trend — cannot carry the screen). It answers the owner's ask directly:
+// find the next airdrop early, while it is still small and growing, even
+// though the implied-value board, which is a value, keeps the giants on top.
+//
 // Farm plans are derived the same way, from category, chains, TVL and age:
-// the action, the capital, the hold and every cost and time. Nothing in the
-// plan names a protocol by hand.
+// the action, the capital, the hold and every cost and time. Gas is priced
+// by chain — cheap on the low-fee networks, dear on Ethereum mainnet — and
+// the last step prices the launch itself against this row's implied value.
+// Nothing in the plan names a protocol by hand.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -83,28 +98,34 @@ export interface ModelConstants {
 
 export const MODEL: ModelConstants = {
   base_multiple: 0.25,
-  growth_weight: 0.6,
+  growth_weight: 0.8,
   growth_floor: -50,
-  growth_cap: 100,
+  growth_cap: 120,
   maturity_young_days: 90,
-  maturity_young_low: 0.55,
-  maturity_young_high: 0.75,
+  maturity_young_low: 0.45,
+  maturity_young_high: 0.7,
   maturity_prime_days: 365,
   maturity_prime_high: 1.0,
   maturity_plateau_days: 730,
   maturity_old_days: 1460,
-  maturity_old_low: 0.75,
-  maturity_floor: 0.7,
+  maturity_old_low: 0.65,
+  maturity_floor: 0.55,
   chain_step: 0.02,
   chain_cap: 5,
   unknown_age_days: 365,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
+
+/** How many protocols the Momentum screen carries, by seven-day growth. */
+export const MOMENTUM_ROWS = 12;
+
+/** The cap on growth for the Momentum screen's ranking: one wild week is usually a re-listing, not a trend. */
+export const MOMENTUM_GROWTH_CAP = 150;
 
 /** A farm step: the action, what it costs, and how long it takes. */
 export interface FarmStep {
@@ -170,7 +191,7 @@ export interface LiveRow {
   change_7d: number | null;
 }
 
-/** Everything the dashboard needs: the board, the live set, and the model it runs. */
+/** Everything the dashboard needs: the board, the live set, the momentum screen, and the model it runs. */
 export interface RadarData {
   as_of: string;
   source: string;
@@ -182,8 +203,10 @@ export interface RadarData {
   board_size: number;
   early_size: number;
   live_size: number;
+  momentum_growth_cap: number;
   rows: RadarRow[];
   live: LiveRow[];
+  early: EarlyRow[];
 }
 
 /** Why the snapshot is not one this model can score. */
@@ -212,9 +235,9 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
 
 /**
  * The maturity curve: how much a protocol's age with no token is worth.
- * Rises 0.55 -> 0.75 over the first 90 days (barely proven), 0.75 -> 1.00
+ * Rises 0.45 -> 0.70 over the first 90 days (barely proven), 0.70 -> 1.00
  * to day 365 (the classic airdrop window), flat at 1.00 to day 730, then
- * falls back toward 0.75 by day 1460 and 0.70 after that (three years with
+ * falls back toward 0.65 by day 1460 and 0.55 after that (three years with
  * no token means the launch may never come).
  */
 export function maturityMultiplier(age: number | null, model: ModelConstants): number {
@@ -351,7 +374,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       chain_multiplier: round4(s.chainMult),
       age_days: s.age,
     },
-    farm_steps: farmSteps(s.p, s.age).map(stepText),
+    farm_steps: farmSteps(s.p, s.age, s.implied).map(stepText),
   }));
 }
 
@@ -423,47 +446,96 @@ function secondActionFor(p: SnapshotProtocol, capital: number, chain: string): s
   return `Make a second, different transaction on ${name} — a swap, a vote or a claim — so the wallet shows more than one kind of activity.`;
 }
 
+/** A compact dollar figure for a farm step: $747.4M, $12.3K, $850. */
+function fmtUsdShort(n: number): string {
+  if (n >= 1e9) return `$${(n / 1e9).toFixed(1)}B`;
+  if (n >= 1e6) return `$${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `$${Math.round(n / 1e3)}K`;
+  return `$${Math.round(n)}`;
+}
+
+/** Chains where one transaction costs about a dollar: the low-fee networks. */
+const CHEAP_CHAINS = new Set([
+  'Arbitrum',
+  'Avalanche',
+  'Base',
+  'Berachain',
+  'Blast',
+  'BSC',
+  'Corn',
+  'Hyperliquid',
+  'Ink',
+  'Katana',
+  'Linea',
+  'Monad',
+  'Optimism',
+  'Plume',
+  'Polygon',
+  'Scroll',
+  'Sei',
+  'Solana',
+  'Sonic',
+  'Stellar',
+  'Sui',
+  'Tron',
+  'Unichain',
+  'zkSync Era',
+]);
+
 /**
- * A protocol's farm plan: eight steps, each an action with a cost and a time.
- * Derived from the protocol's own record (category, chains, TVL, age), never
- * from a hand-written list of names.
+ * What one transaction costs on a chain, in whole dollars: about a dollar
+ * on the low-fee networks, about six on Ethereum mainnet, about three
+ * anywhere else. The chain is the protocol's own record, never a guess.
  */
-export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
+function gasFor(chain: string): number {
+  if (chain === 'Ethereum') return 6;
+  if (CHEAP_CHAINS.has(chain)) return 1;
+  return 3;
+}
+
+/**
+ * A protocol's farm plan: nine steps, each an action with a cost and a time.
+ * Derived from the protocol's own record (category, chains, TVL, age), never
+ * from a hand-written list of names. The last step prices the launch itself
+ * against this row's implied value, so the farmer knows when not to buy.
+ */
+export function farmSteps(p: SnapshotProtocol, age: number | null, implied: number): FarmStep[] {
   const chain = chainOf(p);
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
+  const gas = gasFor(chain);
   const secondChain = p.chains.length > 1 ? p.chains[1]! : null;
   const multiStep: FarmStep =
     secondChain !== null
       ? {
           text: `Repeat the main position with $${Math.max(25, Math.round(capital / 2))} on ${secondChain}, the protocol's second chain, so the farm is not tied to one network.`,
-          cost: `$${Math.max(25, Math.round(capital / 2))} of capital and about $4 of gas`,
+          cost: `$${Math.max(25, Math.round(capital / 2))} of capital and about $${gasFor(secondChain)} of gas`,
           time: '15 minutes to set up',
         }
       : {
           text: `Add a second, smaller position in another pool of ${p.name} on ${chain} so the wallet touches more than one market.`,
-          cost: `$${Math.max(25, Math.round(capital / 2))} of capital and about $4 of gas`,
+          cost: `$${Math.max(25, Math.round(capital / 2))} of capital and about $${gas} of gas`,
           time: '15 minutes to set up',
         };
   return [
     {
       text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.`,
-      cost: 'under $3 of gas for the first transaction',
+      cost: `about $${gas} of gas for the first transaction on ${chain}`,
       time: '5 minutes',
     },
     {
       text: actionFor(p, capital, chain),
-      cost: `$${capital} of capital and about $${capital >= 150 ? 8 : 4} of gas`,
+      cost: `$${capital} of capital and about $${gas} of gas`,
       time: '15 minutes to set up',
     },
     {
       text: secondActionFor(p, capital, chain),
-      cost: `about $${Math.max(10, Math.round(capital / 5))} of capital and about $2 of gas`,
+      cost: `about $${Math.max(10, Math.round(capital / 5))} of capital and about $${gas} of gas`,
       time: '10 minutes',
     },
     {
       text: `Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.`,
-      cost: 'about $2 of gas a week',
+      cost: `about $${gas} of gas a week`,
       time: '10 minutes a week',
     },
     multiStep,
@@ -482,7 +554,57 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       cost: 'nothing but the log',
       time: '10 minutes',
     },
+    {
+      text: `If the token launches, compare its fully diluted value with this row's implied value of ${fmtUsdShort(implied)}: if the launch value is more than twice the implied value, do not buy the listing — wait for the first unlock and re-check the price against the model.`,
+      cost: 'nothing to check; the capital stays out until the price makes sense',
+      time: '10 minutes at launch',
+    },
   ];
+}
+
+/** One row of the Momentum screen: a fast-growing pre-token protocol, ranked by capped seven-day growth. */
+export interface EarlyRow {
+  slug: string;
+  name: string;
+  category: string | null;
+  chains: string[];
+  tvl_usd: number;
+  change_7d: number;
+  capped_growth: number;
+  age_days: number | null;
+  implied_value_usd: number;
+  board_rank: number;
+}
+
+/**
+ * The Momentum screen: the fastest-growing rankable pre-token protocols, by
+ * seven-day growth capped at +150% for ranking, ties broken by TVL. A
+ * protocol whose TVL jumped thousands of per cent in a week is usually a
+ * re-listing, not a trend, so the cap keeps the screen honest; the raw
+ * figure is still shown.
+ */
+export function earlyFinds(snapshot: Snapshot, board: BoardRow[]): EarlyRow[] {
+  const rowBySlug = new Map(board.map((r) => [r.slug, r]));
+  return snapshot.protocols
+    .filter((p) => isRankable(p) && p.change_7d !== null)
+    .map((p) => ({ p, growth: p.change_7d as number, capped: Math.min(p.change_7d as number, MOMENTUM_GROWTH_CAP) }))
+    .sort((a, b) => b.capped - a.capped || b.p.tvl_usd - a.p.tvl_usd || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0))
+    .slice(0, MOMENTUM_ROWS)
+    .map(({ p, growth, capped }) => {
+      const row = rowBySlug.get(p.slug)!;
+      return {
+        slug: p.slug,
+        name: p.name,
+        category: p.category,
+        chains: p.chains,
+        tvl_usd: p.tvl_usd,
+        change_7d: growth,
+        capped_growth: capped,
+        age_days: row.age_days,
+        implied_value_usd: row.implied_value_usd,
+        board_rank: row.rank,
+      };
+    });
 }
 
 /** The live-token protocols, by market cap, for the dashboard's Live token view. */
@@ -527,7 +649,8 @@ export function radarRow(row: BoardRow, watchlist: Set<string>): RadarRow {
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
   const board = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
-  const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
+  const early = earlyFinds(snapshot, board);
+  const earlyCount = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   // The source line the page shows names the index and the fetch date only:
   // data.js is loaded by the dashboard, and the gate refuses a network
   // address in any file the page loads, so no URL is written here.
@@ -540,10 +663,12 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     watchlist: [...snapshot.watchlist],
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
-    early_size: early,
+    early_size: earlyCount,
     live_size: live.length,
+    momentum_growth_cap: MOMENTUM_GROWTH_CAP,
     rows: board.map((r) => radarRow(r, new Set(snapshot.watchlist))),
     live,
+    early,
   };
   return { board, radar };
 }
